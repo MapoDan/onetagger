@@ -83,3 +83,46 @@ cargo build --release
 ```
 
 Output will be inside `target\release` folder.
+
+## Container background worker mode
+
+OneTagger now includes a queue-based API worker that wraps the existing CLI (`onetagger-cli`) without changing the desktop architecture.
+
+### Build worker image
+
+```bash
+docker build -f Dockerfile.worker -t onetagger-worker:local .
+```
+
+### Run worker container
+
+```bash
+docker run -d --name onetagger-worker \
+  -p 8080:8080 \
+  -v $(pwd)/config:/config \
+  -v /path/to/your/music:/music \
+  onetagger-worker:local
+```
+
+### API
+
+- `GET /health` - liveness probe
+- `GET /status` - returns currently running job id and queued job ids
+- `POST /jobs` - enqueue new tagging job (FIFO, one at a time)
+
+Example request:
+
+```bash
+curl -X POST http://localhost:8080/jobs \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "file": "/music",
+    "config": "/config/autotagger.json"
+  }'
+```
+
+If `config` is omitted, worker uses `/config/autotagger.json`.
+
+### Portainer deployment
+
+Use `docker-compose.worker.yml` as a stack template and change image tag to a published image (for example GHCR), so Portainer can auto-pull updates without local builds.
