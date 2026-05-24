@@ -1,6 +1,18 @@
 FROM rust:1.88-bookworm AS builder
 WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates curl git pkg-config make g++ libssl-dev libasound2-dev && \
+    rm -rf /var/lib/apt/lists/*
+
+# Build frontend assets required by onetagger-ui (embedded in onetagger-cli).
+RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
+    apt-get update && apt-get install -y --no-install-recommends nodejs && \
+    npm install -g pnpm && \
+    rm -rf /var/lib/apt/lists/*
+
 COPY . .
+RUN cd client && pnpm install --frozen-lockfile && pnpm run build
 RUN cargo build --release -p onetagger-cli -p onetagger-worker
 
 FROM debian:bookworm-slim
