@@ -126,3 +126,15 @@ If `config` is omitted, worker uses `/config/autotagger.json`.
 ### Portainer deployment
 
 Use `docker-compose.worker.yml` as a stack template and change image tag to a published image (for example GHCR), so Portainer can auto-pull updates without local builds.
+
+### Automated GHCR publishing (GitHub CI/CD)
+
+The repository now includes `.github/workflows/docker-worker.yml` which automatically builds and publishes the worker image to GitHub Container Registry (GHCR).
+
+- Push to `master` (with worker-related file changes) publishes updated images
+- Git tag pushes matching `v*` publish versioned images
+- Manual runs are available through `workflow_dispatch`
+- Published image: `ghcr.io/<owner>/onetagger-worker`
+- Multi-arch output: `linux/amd64` and `linux/arm64`
+
+This enables Portainer stacks to auto-pull prebuilt images without local rebuilding.
