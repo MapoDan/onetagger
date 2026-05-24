@@ -2,7 +2,7 @@ FROM rust:1.88-bookworm AS builder
 WORKDIR /app
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates curl git pkg-config make g++ libssl-dev libasound2-dev && \
+    ca-certificates curl git pkg-config make g++ binutils lld libssl-dev libasound2-dev && \
     rm -rf /var/lib/apt/lists/*
 
 # Build frontend assets required by onetagger-ui (embedded in onetagger-cli).
