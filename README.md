@@ -83,3 +83,58 @@ cargo build --release
 ```
 
 Output will be inside `target\release` folder.
+
+## Container background worker mode
+
+OneTagger now includes a queue-based API worker that wraps the existing CLI (`onetagger-cli`) without changing the desktop architecture.
+
+### Build worker image
+
+```bash
+docker build -f Dockerfile.worker -t onetagger-worker:local .
+```
+
+### Run worker container
+
+```bash
+docker run -d --name onetagger-worker \
+  -p 8080:8080 \
+  -v $(pwd)/config:/config \
+  -v /path/to/your/music:/music \
+  onetagger-worker:local
+```
+
+### API
+
+- `GET /health` - liveness probe
+- `GET /status` - returns currently running job id and queued job ids
+- `POST /jobs` - enqueue new tagging job (FIFO, one at a time)
+
+Example request:
+
+```bash
+curl -X POST http://localhost:8080/jobs \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "file": "/music",
+    "config": "/config/autotagger.json"
+  }'
+```
+
+If `config` is omitted, worker uses `/config/autotagger.json`.
+
+### Portainer deployment
+
+Use `docker-compose.worker.yml` as a stack template and change image tag to a published image (for example GHCR), so Portainer can auto-pull updates without local builds.
+
+### Automated GHCR publishing (GitHub CI/CD)
+
+The repository now includes `.github/workflows/docker-worker.yml` which automatically builds and publishes the worker image to GitHub Container Registry (GHCR).
+
+- Push to `master` (with worker-related file changes) publishes updated images
+- Git tag pushes matching `v*` publish versioned images
+- Manual runs are available through `workflow_dispatch`
+- Published image: `ghcr.io/<owner>/onetagger-worker`
+- Multi-arch output: `linux/amd64` and `linux/arm64`
+
+This enables Portainer stacks to auto-pull prebuilt images without local rebuilding.
