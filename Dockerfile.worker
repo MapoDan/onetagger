@@ -12,7 +12,7 @@ RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
     rm -rf /var/lib/apt/lists/*
 
 COPY . .
-RUN cd client && pnpm install --frozen-lockfile && pnpm run build
+RUN cd client && pnpm install --no-frozen-lockfile && pnpm run build
 RUN cargo build --release -p onetagger-cli -p onetagger-worker
 
 FROM debian:bookworm-slim
