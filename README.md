@@ -86,55 +86,142 @@ Output will be inside `target\release` folder.
 
 ## Container background worker mode
 
-OneTagger now includes a queue-based API worker that wraps the existing CLI (`onetagger-cli`) without changing the desktop architecture.
+This repository includes a **container-first background worker runtime** that wraps the existing `onetagger-cli`.
+The objective is to preserve upstream OneTagger behavior while making it usable as an always-on API-driven service.
 
-### Build worker image
+### Scope and architecture (what this is / what this is not)
+
+**Included in scope**
+- Always-on worker process, suitable for Docker/Portainer deployment.
+- API endpoint to enqueue tagging jobs.
+- Internal FIFO queue with **single-job execution** (one job at a time).
+- Reuse of upstream CLI logic (`onetagger-cli autotagger`) as the execution engine.
+- Externalized configuration and music volumes.
+- Automated GHCR publishing workflow.
+
+**Out of scope**
+- No rewrite of desktop UI architecture.
+- No migration to a full microservice ecosystem.
+- No external broker dependency (Redis/RabbitMQ).
+
+### Functional flow
+
+1. Orchestrator sends `POST /jobs` with a file/folder path.
+2. Worker accepts request (`202 Accepted`) and adds it to queue.
+3. Worker executes queued jobs sequentially.
+4. Worker invokes `onetagger-cli autotagger` internally for each job.
+5. Job status visibility is available through `GET /status`.
+
+### API specification
+
+#### `GET /health`
+Liveness endpoint.
+
+**Response**
+```text
+ok
+```
+
+#### `GET /status`
+Returns current queue state.
+
+**Example response**
+```json
+{
+  "running": "c6f1f1b2-6cbf-4f0a-9e0b-b2fb3557e8f7",
+  "queued": [
+    "0e5f6d9f-1fe0-45b4-8aa5-3fbd478cad69"
+  ]
+}
+```
+
+#### `POST /jobs`
+Enqueue a new autotagger job.
+
+**Request body**
+```json
+{
+  "file": "/music",
+  "config": "/config/autotagger.json",
+  "extra_args": ["--overwrite", "--threads", "4"]
+}
+```
+
+**Fields**
+- `file` (required): input path passed to `onetagger-cli autotagger --path`.
+- `config` (optional): config path passed to `--config`.
+  - Default: `/config/autotagger.json`.
+- `extra_args` (optional): additional CLI flags appended as-is.
+
+**Accepted response (202)**
+```json
+{
+  "id": "0e5f6d9f-1fe0-45b4-8aa5-3fbd478cad69",
+  "queue_position": 2
+}
+```
+
+### Installation and deployment
+
+#### Option A - Pull prebuilt image (recommended)
+
+```bash
+docker pull ghcr.io/<owner>/onetagger-worker:latest
+```
+
+#### Option B - Build locally
 
 ```bash
 docker build -f Dockerfile.worker -t onetagger-worker:local .
 ```
 
-### Run worker container
+### Runtime prerequisites
+
+- A mounted music library (example: `/music`).
+- A mounted configuration directory (example: `/config`).
+- A valid OneTagger autotagger configuration JSON available at `/config/autotagger.json` (unless `config` is sent explicitly per job).
+
+### Run with Docker
 
 ```bash
-docker run -d --name onetagger-worker \
-  -p 8080:8080 \
-  -v $(pwd)/config:/config \
-  -v /path/to/your/music:/music \
-  onetagger-worker:local
+docker run -d --name onetagger-worker   -p 8080:8080   -v $(pwd)/config:/config   -v /path/to/your/music:/music   -e RUST_LOG=info   ghcr.io/<owner>/onetagger-worker:latest
 ```
 
-### API
+### Run with Docker Compose / Portainer
 
-- `GET /health` - liveness probe
-- `GET /status` - returns currently running job id and queued job ids
-- `POST /jobs` - enqueue new tagging job (FIFO, one at a time)
+Use `docker-compose.worker.yml` as stack template:
+- set your published image tag,
+- map `/music` to your host music folder,
+- map `/config` to persistent host storage.
 
-Example request:
+This enables Portainer to auto-pull image updates without local builds.
 
-```bash
-curl -X POST http://localhost:8080/jobs \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "file": "/music",
-    "config": "/config/autotagger.json"
-  }'
-```
+### Worker configuration (environment variables)
 
-If `config` is omitted, worker uses `/config/autotagger.json`.
+- `ONETAGGER_WORKER_BIND` (default: `0.0.0.0:8080`)
+- `ONETAGGER_CLI_BIN` (default: `/usr/local/bin/onetagger-cli` inside image)
+- `ONETAGGER_CONFIG_DIR` (default: `/config`)
+- `RUST_LOG` (recommended: `info` or `debug`)
 
-### Portainer deployment
+### Troubleshooting and observability
 
-Use `docker-compose.worker.yml` as a stack template and change image tag to a published image (for example GHCR), so Portainer can auto-pull updates without local builds.
+- Use `docker logs -f onetagger-worker` for runtime logs.
+- Startup logs show bind address, CLI binary path and config directory.
+- Each request logs: job id, queue position, path and custom config usage.
+- Each execution logs: resolved config path, extra args and CLI invocation lifecycle.
+- Failures include CLI exit code plus stdout/stderr to speed up root-cause analysis.
 
 ### Automated GHCR publishing (GitHub CI/CD)
 
-The repository now includes `.github/workflows/docker-worker.yml` which automatically builds and publishes the worker image to GitHub Container Registry (GHCR).
+Workflow: `.github/workflows/docker-worker.yml`
 
-- Push to `master` (with worker-related file changes) publishes updated images
-- Git tag pushes matching `v*` publish versioned images
-- Manual runs are available through `workflow_dispatch`
-- Published image: `ghcr.io/<owner>/onetagger-worker`
-- Multi-arch output: `linux/amd64` and `linux/arm64`
+**Triggers**
+- Push on `master` for worker-related files.
+- Tag pushes matching `v*`.
+- Manual run (`workflow_dispatch`).
 
-This enables Portainer stacks to auto-pull prebuilt images without local rebuilding.
+**Output**
+- Image: `ghcr.io/<owner>/onetagger-worker`
+- Architectures: `linux/amd64`, `linux/arm64`
+- Tags: branch/tag/sha + `latest` on default branch
+
