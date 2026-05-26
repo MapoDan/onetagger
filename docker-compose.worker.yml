@@ -1,0 +1,13 @@
+services:
+  onetagger-worker:
+    image: ghcr.io/marekkon5/onetagger-worker:latest
+    container_name: onetagger-worker
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./config:/config
+      - /path/to/your/music:/music
+    environment:
+      ONETAGGER_WORKER_BIND: 0.0.0.0:8080
+      ONETAGGER_CONFIG_DIR: /config
