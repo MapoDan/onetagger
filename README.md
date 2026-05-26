@@ -149,6 +149,7 @@ Enqueue a new autotagger job.
 
 **Fields**
 - `file` (required): input path passed to `onetagger-cli autotagger --path`.
+  - If you send a single audio file path, worker auto-wraps it into a temporary `.m3u8` playlist for CLI compatibility.
 - `config` (optional): config path passed to `--config`.
   - Default: `/config/autotagger.json`.
 - `extra_args` (optional): additional CLI flags appended as-is.

@@ -1,4 +1,4 @@
-use std::{collections::VecDeque, net::SocketAddr, path::PathBuf, sync::Arc};
+use std::{collections::VecDeque, net::SocketAddr, path::{Path, PathBuf}, sync::Arc};
 
 use anyhow::{anyhow, bail, Context, Result};
 use axum::{
@@ -76,6 +76,8 @@ struct QueueState {
     running: Option<Uuid>,
     queued: VecDeque<Uuid>,
 }
+
+const PLAYLIST_EXTENSIONS: [&str; 2] = ["m3u", "m3u8"];
 
 #[derive(Clone)]
 struct AppState {
@@ -173,10 +175,26 @@ async fn enqueue_job(
     }
 
     let id = Uuid::new_v4();
-    let job = Job {
-        id,
-        req: req.clone(),
+
+    let resolved_job_file = match normalize_cli_input_path(&state.config_dir, id, &req.file).await {
+        Ok(path) => path,
+        Err(e) => {
+            error!(job_id = %id, path = %req.file.display(), error = %e, "job rejected: invalid input path for cli");
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!("invalid input path: {e}"),
+                    "path": req.file.display().to_string()
+                })),
+            )
+                .into_response();
+        }
     };
+
+    let mut req = req.clone();
+    req.file = resolved_job_file;
+
+    let job = Job { id, req };
 
     let queue_position = {
         let mut guard = state.queue_state.lock().await;
@@ -186,7 +204,7 @@ async fn enqueue_job(
 
     info!(
         job_id = %id,
-        path = %req.file.display(),
+        path = %job.req.file.display(),
         queue_position,
         has_custom_config = req.config.is_some(),
         extra_args = req.extra_args.as_ref().map(|a| a.len()).unwrap_or(0),
@@ -333,6 +351,51 @@ async fn ensure_default_config(cli: &Cli) -> Result<()> {
 
     info!(config = %config_path.display(), "default autotagger config generated");
     Ok(())
+}
+
+
+/// Normalize API `file` path into a CLI-compatible `--path` value.
+///
+/// `onetagger-cli autotagger` treats any file path as a playlist file. For single
+/// audio file requests, worker creates an ephemeral `.m3u8` file that points to
+/// that audio file and passes playlist path to CLI.
+async fn normalize_cli_input_path(config_dir: &Path, job_id: Uuid, requested: &Path) -> Result<PathBuf> {
+    if requested.is_dir() {
+        return Ok(requested.to_path_buf());
+    }
+
+    if !requested.is_file() {
+        bail!("path is neither existing directory nor file");
+    }
+
+    let ext = requested
+        .extension()
+        .map(|e| e.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+
+    if PLAYLIST_EXTENSIONS.iter().any(|e| *e == ext) {
+        return Ok(requested.to_path_buf());
+    }
+
+    let queue_dir = config_dir.join("queue");
+    fs::create_dir_all(&queue_dir)
+        .await
+        .with_context(|| format!("failed creating queue dir {}", queue_dir.display()))?;
+
+    let playlist_path = queue_dir.join(format!("job-{job_id}.m3u8"));
+    let data = format!("#EXTM3U\n{}\n", requested.display());
+    fs::write(&playlist_path, data)
+        .await
+        .with_context(|| format!("failed writing temp playlist {}", playlist_path.display()))?;
+
+    info!(
+        job_id = %job_id,
+        requested = %requested.display(),
+        temp_playlist = %playlist_path.display(),
+        "wrapped single file request into temporary playlist for cli compatibility"
+    );
+
+    Ok(playlist_path)
 }
 
 async fn shutdown_signal() {
