@@ -1,6 +1,6 @@
 use std::{collections::VecDeque, net::SocketAddr, path::PathBuf, sync::Arc};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use axum::{
     extract::State,
     http::StatusCode,
@@ -11,6 +11,7 @@ use axum::{
 use clap::Parser;
 use serde::{Deserialize, Serialize};
 use tokio::{
+    fs,
     process::Command,
     sync::{mpsc, Mutex},
 };
@@ -80,6 +81,7 @@ struct QueueState {
 struct AppState {
     tx: mpsc::Sender<Job>,
     queue_state: Arc<Mutex<QueueState>>,
+    config_dir: PathBuf,
 }
 
 #[tokio::main]
@@ -101,13 +103,19 @@ async fn main() -> Result<()> {
         .context("create config dir")?;
     info!(config_dir = %cli.config_dir.display(), "ensured config directory exists");
 
+    ensure_default_config(&cli).await?;
+
     // Single consumer with buffered producer channel guarantees serialized execution.
     let (tx, rx) = mpsc::channel::<Job>(1024);
     let queue_state = Arc::new(Mutex::new(QueueState::default()));
 
     tokio::spawn(worker_loop(rx, queue_state.clone(), cli.clone()));
 
-    let state = AppState { tx, queue_state };
+    let state = AppState {
+        tx,
+        queue_state,
+        config_dir: cli.config_dir.clone(),
+    };
     let app = Router::new()
         .route("/health", get(|| async { "ok" }))
         .route("/status", get(status_handler))
@@ -130,6 +138,40 @@ async fn enqueue_job(
     State(state): State<AppState>,
     Json(req): Json<JobRequest>,
 ) -> impl IntoResponse {
+    info!(payload = ?req, "received enqueue request payload");
+
+    if !req.file.exists() {
+        error!(path = %req.file.display(), "job rejected: input path does not exist");
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "input path does not exist",
+                "path": req.file.display().to_string()
+            })),
+        )
+            .into_response();
+    }
+
+    let resolved_config = req
+        .config
+        .clone()
+        .unwrap_or_else(|| state.config_dir.join("autotagger.json"));
+    if !resolved_config.exists() {
+        error!(
+            config = %resolved_config.display(),
+            "job rejected: config path does not exist"
+        );
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "config path does not exist",
+                "config": resolved_config.display().to_string(),
+                "hint": "mount /config and provide autotagger.json or pass explicit config in payload"
+            })),
+        )
+            .into_response();
+    }
+
     let id = Uuid::new_v4();
     let job = Job {
         id,
@@ -251,6 +293,45 @@ async fn run_job(cli: &Cli, job: &Job) -> Result<()> {
         stderr_bytes = output.stderr.len(),
         "cli process completed successfully"
     );
+    Ok(())
+}
+
+/// Ensures that `/config/autotagger.json` exists for default worker flow.
+///
+/// If missing, we generate it by invoking `onetagger-cli --autotagger-config` and
+/// writing the output to the configured path.
+async fn ensure_default_config(cli: &Cli) -> Result<()> {
+    let config_path = cli.config_dir.join("autotagger.json");
+    if config_path.exists() {
+        info!(config = %config_path.display(), "default autotagger config found");
+        return Ok(());
+    }
+
+    warn!(
+        config = %config_path.display(),
+        "default autotagger config missing, generating it"
+    );
+
+    let output = Command::new(&cli.cli_bin)
+        .arg("--autotagger-config")
+        .output()
+        .await
+        .context("failed to run onetagger-cli --autotagger-config")?;
+
+    if !output.status.success() {
+        bail!(
+            "failed to generate default config, status={} stderr={} stdout={}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr),
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+
+    fs::write(&config_path, &output.stdout)
+        .await
+        .with_context(|| format!("failed writing default config to {}", config_path.display()))?;
+
+    info!(config = %config_path.display(), "default autotagger config generated");
     Ok(())
 }
 

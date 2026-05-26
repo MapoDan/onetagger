@@ -179,7 +179,8 @@ docker build -f Dockerfile.worker -t onetagger-worker:local .
 
 - A mounted music library (example: `/music`).
 - A mounted configuration directory (example: `/config`).
-- A valid OneTagger autotagger configuration JSON available at `/config/autotagger.json` (unless `config` is sent explicitly per job).
+- Worker auto-generates `/config/autotagger.json` at startup when missing (using `onetagger-cli --autotagger-config`).
+- You can still pass an explicit `config` path per job.
 
 ### Run with Docker
 
@@ -207,7 +208,8 @@ This enables Portainer to auto-pull image updates without local builds.
 
 - Use `docker logs -f onetagger-worker` for runtime logs.
 - Startup logs show bind address, CLI binary path and config directory.
-- Each request logs: job id, queue position, path and custom config usage.
+- Each API request logs the **full received payload** (`file`, `config`, `extra_args`) for troubleshooting.
+- Each request also logs job id, queue position, path and custom config usage.
 - Each execution logs: resolved config path, extra args and CLI invocation lifecycle.
 - Failures include CLI exit code plus stdout/stderr to speed up root-cause analysis.
 
