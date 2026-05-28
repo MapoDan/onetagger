@@ -1,4 +1,9 @@
-use std::{collections::VecDeque, net::SocketAddr, path::{Path, PathBuf}, sync::Arc};
+use std::{
+    collections::VecDeque,
+    net::SocketAddr,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use anyhow::{anyhow, bail, Context, Result};
 use axum::{
@@ -206,8 +211,8 @@ async fn enqueue_job(
         job_id = %id,
         path = %job.req.file.display(),
         queue_position,
-        has_custom_config = req.config.is_some(),
-        extra_args = req.extra_args.as_ref().map(|a| a.len()).unwrap_or(0),
+        has_custom_config = job.req.config.is_some(),
+        extra_args = job.req.extra_args.as_ref().map(|a| a.len()).unwrap_or(0),
         "job accepted"
     );
 
@@ -353,13 +358,16 @@ async fn ensure_default_config(cli: &Cli) -> Result<()> {
     Ok(())
 }
 
-
 /// Normalize API `file` path into a CLI-compatible `--path` value.
 ///
 /// `onetagger-cli autotagger` treats any file path as a playlist file. For single
 /// audio file requests, worker creates an ephemeral `.m3u8` file that points to
 /// that audio file and passes playlist path to CLI.
-async fn normalize_cli_input_path(config_dir: &Path, job_id: Uuid, requested: &Path) -> Result<PathBuf> {
+async fn normalize_cli_input_path(
+    config_dir: &Path,
+    job_id: Uuid,
+    requested: &Path,
+) -> Result<PathBuf> {
     if requested.is_dir() {
         return Ok(requested.to_path_buf());
     }
