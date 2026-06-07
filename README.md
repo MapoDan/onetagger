@@ -186,31 +186,8 @@ docker build -f Dockerfile.worker -t onetagger-worker:local .
 ### Run with Docker
 
 ```bash
-docker run -d --name onetagger-worker \
-  -p 8080:8080 \
-  -v $(pwd)/config:/config \
-  -v /path/to/your/music:/music \
-  -e RUST_LOG=info \
-  ghcr.io/<owner>/onetagger-worker:latest
+docker run -d --name onetagger-worker   -p 8080:8080   -v $(pwd)/config:/config   -v /path/to/your/music:/music   -e RUST_LOG=info   ghcr.io/<owner>/onetagger-worker:latest
 ```
-
-
-### Optional startup processing
-
-By default, the worker is intentionally idle after startup and waits for API calls (`POST /jobs`).
-If you want the container to process a folder automatically when it starts, set `ONETAGGER_STARTUP_PATH`:
-
-```bash
-docker run -d --name onetagger-worker \
-  -p 8080:8080 \
-  -v $(pwd)/config:/config \
-  -v /path/to/your/music:/music \
-  -e ONETAGGER_STARTUP_PATH=/music/clean \
-  -e RUST_LOG=info \
-  ghcr.io/<owner>/onetagger-worker:latest
-```
-
-This enqueues the configured path once at boot. The API remains available for additional queued jobs.
 
 ### Run with Docker Compose / Portainer
 
@@ -226,8 +203,7 @@ This enables Portainer to auto-pull image updates without local builds.
 - `ONETAGGER_WORKER_BIND` (default: `0.0.0.0:8080`)
 - `ONETAGGER_CLI_BIN` (default: `/usr/local/bin/onetagger-cli` inside image)
 - `ONETAGGER_CONFIG_DIR` (default: `/config`)
-- `RUST_LOG` (default in container: `info`; use `debug` for detailed troubleshooting)
-- `ONETAGGER_STARTUP_PATH` (optional; when set, this path is queued once when the container starts)
+- `RUST_LOG` (recommended: `info` or `debug`)
 
 ### Troubleshooting and observability
 

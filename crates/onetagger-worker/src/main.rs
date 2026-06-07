@@ -21,7 +21,6 @@ use tokio::{
     sync::{mpsc, Mutex},
 };
 use tracing::{debug, error, info, warn};
-use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
 /// OneTagger Worker runtime configuration.
@@ -41,13 +40,6 @@ struct Cli {
     /// Directory used to store/read externalized configuration.
     #[arg(long, env = "ONETAGGER_CONFIG_DIR", default_value = "/config")]
     config_dir: PathBuf,
-
-    /// Optional path automatically queued once at worker startup.
-    ///
-    /// Leave unset for pure API-driven operation. This is useful for simple
-    /// deployments that want the container to process a mounted folder on boot.
-    #[arg(long, env = "ONETAGGER_STARTUP_PATH")]
-    startup_path: Option<PathBuf>,
 }
 
 /// Payload accepted by `POST /jobs`.
@@ -102,9 +94,7 @@ struct AppState {
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
     let cli = Cli::parse();
@@ -112,7 +102,6 @@ async fn main() -> Result<()> {
         bind = %cli.bind,
         cli_bin = %cli.cli_bin,
         config_dir = %cli.config_dir.display(),
-        startup_path = ?cli.startup_path,
         "starting onetagger worker"
     );
 
@@ -134,13 +123,6 @@ async fn main() -> Result<()> {
         queue_state,
         config_dir: cli.config_dir.clone(),
     };
-
-    if let Some(startup_path) = &cli.startup_path {
-        info!(path = %startup_path.display(), "startup path configured, enqueueing initial job");
-        enqueue_startup_job(&state, startup_path.clone()).await;
-    } else {
-        info!("no startup path configured; worker is idle and waiting for POST /jobs requests");
-    }
     let app = Router::new()
         .route("/health", get(|| async { "ok" }))
         .route("/status", get(status_handler))
@@ -159,46 +141,22 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn enqueue_startup_job(state: &AppState, file: PathBuf) {
-    let req = JobRequest {
-        file,
-        config: None,
-        extra_args: None,
-    };
-
-    match prepare_job(state, req).await {
-        Ok((job, queue_position)) => {
-            let job_id = job.id;
-            if let Err(e) = state.tx.send(job).await {
-                let mut guard = state.queue_state.lock().await;
-                guard.queued.retain(|x| *x != job_id);
-                error!(job_id = %job_id, error = %e, "startup job queue send failed");
-                return;
-            }
-
-            info!(job_id = %job_id, queue_position, "startup job queued");
-        }
-        Err((status, body)) => {
-            error!(status = %status, error = %body, "startup job rejected");
-        }
-    }
-}
-
-async fn prepare_job(
-    state: &AppState,
-    req: JobRequest,
-) -> Result<(Job, usize), (StatusCode, serde_json::Value)> {
+async fn enqueue_job(
+    State(state): State<AppState>,
+    Json(req): Json<JobRequest>,
+) -> impl IntoResponse {
     info!(payload = ?req, "received enqueue request payload");
 
     if !req.file.exists() {
         error!(path = %req.file.display(), "job rejected: input path does not exist");
-        return Err((
+        return (
             StatusCode::BAD_REQUEST,
-            serde_json::json!({
+            Json(serde_json::json!({
                 "error": "input path does not exist",
                 "path": req.file.display().to_string()
-            }),
-        ));
+            })),
+        )
+            .into_response();
     }
 
     let resolved_config = req
@@ -210,32 +168,35 @@ async fn prepare_job(
             config = %resolved_config.display(),
             "job rejected: config path does not exist"
         );
-        return Err((
+        return (
             StatusCode::BAD_REQUEST,
-            serde_json::json!({
+            Json(serde_json::json!({
                 "error": "config path does not exist",
                 "config": resolved_config.display().to_string(),
                 "hint": "mount /config and provide autotagger.json or pass explicit config in payload"
-            }),
-        ));
+            })),
+        )
+            .into_response();
     }
 
     let id = Uuid::new_v4();
 
-    let resolved_job_file = normalize_cli_input_path(&state.config_dir, id, &req.file)
-        .await
-        .map_err(|e| {
+    let resolved_job_file = match normalize_cli_input_path(&state.config_dir, id, &req.file).await {
+        Ok(path) => path,
+        Err(e) => {
             error!(job_id = %id, path = %req.file.display(), error = %e, "job rejected: invalid input path for cli");
-            (
+            return (
                 StatusCode::BAD_REQUEST,
-                serde_json::json!({
+                Json(serde_json::json!({
                     "error": format!("invalid input path: {e}"),
                     "path": req.file.display().to_string()
-                }),
+                })),
             )
-        })?;
+                .into_response();
+        }
+    };
 
-    let mut req = req;
+    let mut req = req.clone();
     req.file = resolved_job_file;
 
     let job = Job { id, req };
@@ -255,19 +216,6 @@ async fn prepare_job(
         "job accepted"
     );
 
-    Ok((job, queue_position))
-}
-
-async fn enqueue_job(
-    State(state): State<AppState>,
-    Json(req): Json<JobRequest>,
-) -> impl IntoResponse {
-    let (job, queue_position) = match prepare_job(&state, req).await {
-        Ok(prepared) => prepared,
-        Err((status, body)) => return (status, Json(body)).into_response(),
-    };
-
-    let id = job.id;
     if let Err(e) = state.tx.send(job).await {
         let mut guard = state.queue_state.lock().await;
         guard.queued.retain(|x| *x != id);
@@ -281,7 +229,7 @@ async fn enqueue_job(
 
     (
         StatusCode::ACCEPTED,
-        Json(serde_json::json!(JobAccepted { id, queue_position })),
+        Json(JobAccepted { id, queue_position }),
     )
         .into_response()
 }
