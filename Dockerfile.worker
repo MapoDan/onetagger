@@ -1,0 +1,30 @@
+FROM rust:1.88-bookworm AS builder
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates curl git pkg-config make g++ binutils lld libssl-dev libasound2-dev && \
+    rm -rf /var/lib/apt/lists/*
+
+# Build frontend assets required by onetagger-ui (embedded in onetagger-cli).
+RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
+    apt-get update && apt-get install -y --no-install-recommends nodejs && \
+    npm install -g pnpm && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY . .
+RUN cd client && pnpm install --no-frozen-lockfile && pnpm run build
+RUN cargo build --release -p onetagger-cli -p onetagger-worker
+
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates libssl3 libasound2 && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+COPY --from=builder /app/target/release/onetagger-cli /usr/local/bin/onetagger-cli
+COPY --from=builder /app/target/release/onetagger-worker /usr/local/bin/onetagger-worker
+VOLUME ["/music", "/config"]
+EXPOSE 8080
+ENV ONETAGGER_WORKER_BIND=0.0.0.0:8080 \
+    ONETAGGER_CLI_BIN=/usr/local/bin/onetagger-cli \
+    ONETAGGER_CONFIG_DIR=/config \
+    RUST_LOG=info
+ENTRYPOINT ["/usr/local/bin/onetagger-worker"]

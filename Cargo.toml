@@ -11,7 +11,8 @@ members = [
     "crates/onetagger-renamer",
     "crates/onetagger-autotag",
     "crates/onetagger-playlist",
-    "crates/onetagger-platforms"
+    "crates/onetagger-platforms",
+    "crates/onetagger-worker"
 ]
 
 # Workaround for MacOS
