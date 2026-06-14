@@ -1,10 +1,8 @@
 use std::{
     collections::VecDeque,
-    ffi::OsStr,
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::Arc,
-    time::SystemTime,
 };
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -23,7 +21,6 @@ use tokio::{
     sync::{mpsc, Mutex},
 };
 use tracing::{debug, error, info, warn};
-use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
 /// OneTagger Worker runtime configuration.
@@ -43,13 +40,6 @@ struct Cli {
     /// Directory used to store/read externalized configuration.
     #[arg(long, env = "ONETAGGER_CONFIG_DIR", default_value = "/config")]
     config_dir: PathBuf,
-
-    /// Optional path automatically queued once at worker startup.
-    ///
-    /// Leave unset for pure API-driven operation. This is useful for simple
-    /// deployments that want the container to process a mounted folder on boot.
-    #[arg(long, env = "ONETAGGER_STARTUP_PATH")]
-    startup_path: Option<PathBuf>,
 }
 
 /// Payload accepted by `POST /jobs`.
@@ -83,9 +73,6 @@ struct StatusResponse {
 struct Job {
     id: Uuid,
     req: JobRequest,
-    original_path: PathBuf,
-    temp_playlist: Option<PathBuf>,
-    success_destination: Option<PathBuf>,
 }
 
 /// Queue tracking state used to provide visibility via `/status`.
@@ -97,18 +84,6 @@ struct QueueState {
 
 const PLAYLIST_EXTENSIONS: [&str; 2] = ["m3u", "m3u8"];
 
-#[derive(Debug)]
-struct NormalizedInput {
-    cli_path: PathBuf,
-    temp_playlist: Option<PathBuf>,
-}
-
-#[derive(Debug, Default)]
-struct AutotaggerMoveConfig {
-    move_success: bool,
-    move_success_path: Option<PathBuf>,
-}
-
 #[derive(Clone)]
 struct AppState {
     tx: mpsc::Sender<Job>,
@@ -119,9 +94,7 @@ struct AppState {
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
     let cli = Cli::parse();
@@ -129,7 +102,6 @@ async fn main() -> Result<()> {
         bind = %cli.bind,
         cli_bin = %cli.cli_bin,
         config_dir = %cli.config_dir.display(),
-        startup_path = ?cli.startup_path,
         "starting onetagger worker"
     );
 
@@ -151,13 +123,6 @@ async fn main() -> Result<()> {
         queue_state,
         config_dir: cli.config_dir.clone(),
     };
-
-    if let Some(startup_path) = &cli.startup_path {
-        info!(path = %startup_path.display(), "startup path configured, enqueueing initial job");
-        enqueue_startup_job(&state, startup_path.clone()).await;
-    } else {
-        info!("no startup path configured; worker is idle and waiting for POST /jobs requests");
-    }
     let app = Router::new()
         .route("/health", get(|| async { "ok" }))
         .route("/status", get(status_handler))
@@ -176,46 +141,22 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn enqueue_startup_job(state: &AppState, file: PathBuf) {
-    let req = JobRequest {
-        file,
-        config: None,
-        extra_args: None,
-    };
-
-    match prepare_job(state, req).await {
-        Ok((job, queue_position)) => {
-            let job_id = job.id;
-            if let Err(e) = state.tx.send(job).await {
-                let mut guard = state.queue_state.lock().await;
-                guard.queued.retain(|x| *x != job_id);
-                error!(job_id = %job_id, error = %e, "startup job queue send failed");
-                return;
-            }
-
-            info!(job_id = %job_id, queue_position, "startup job queued");
-        }
-        Err((status, body)) => {
-            error!(status = %status, error = %body, "startup job rejected");
-        }
-    }
-}
-
-async fn prepare_job(
-    state: &AppState,
-    req: JobRequest,
-) -> Result<(Job, usize), (StatusCode, serde_json::Value)> {
+async fn enqueue_job(
+    State(state): State<AppState>,
+    Json(req): Json<JobRequest>,
+) -> impl IntoResponse {
     info!(payload = ?req, "received enqueue request payload");
 
     if !req.file.exists() {
         error!(path = %req.file.display(), "job rejected: input path does not exist");
-        return Err((
+        return (
             StatusCode::BAD_REQUEST,
-            serde_json::json!({
+            Json(serde_json::json!({
                 "error": "input path does not exist",
                 "path": req.file.display().to_string()
-            }),
-        ));
+            })),
+        )
+            .into_response();
     }
 
     let resolved_config = req
@@ -227,58 +168,38 @@ async fn prepare_job(
             config = %resolved_config.display(),
             "job rejected: config path does not exist"
         );
-        return Err((
+        return (
             StatusCode::BAD_REQUEST,
-            serde_json::json!({
+            Json(serde_json::json!({
                 "error": "config path does not exist",
                 "config": resolved_config.display().to_string(),
                 "hint": "mount /config and provide autotagger.json or pass explicit config in payload"
-            }),
-        ));
+            })),
+        )
+            .into_response();
     }
 
-    let move_config = load_move_config(&resolved_config).await.map_err(|e| {
-        error!(config = %resolved_config.display(), error = %e, "job rejected: failed reading autotagger move configuration");
-        (
-            StatusCode::BAD_REQUEST,
-            serde_json::json!({
-                "error": format!("failed reading autotagger move configuration: {e}"),
-                "config": resolved_config.display().to_string()
-            }),
-        )
-    })?;
-
     let id = Uuid::new_v4();
-    let original_path = req.file.clone();
 
-    let normalized_input = normalize_cli_input_path(&state.config_dir, id, &req.file)
-        .await
-        .map_err(|e| {
+    let resolved_job_file = match normalize_cli_input_path(&state.config_dir, id, &req.file).await {
+        Ok(path) => path,
+        Err(e) => {
             error!(job_id = %id, path = %req.file.display(), error = %e, "job rejected: invalid input path for cli");
-            (
+            return (
                 StatusCode::BAD_REQUEST,
-                serde_json::json!({
+                Json(serde_json::json!({
                     "error": format!("invalid input path: {e}"),
                     "path": req.file.display().to_string()
-                }),
+                })),
             )
-        })?;
-
-    let mut req = req;
-    req.file = normalized_input.cli_path;
-
-    let success_destination = move_config
-        .move_success
-        .then_some(move_config.move_success_path)
-        .flatten();
-
-    let job = Job {
-        id,
-        req,
-        original_path,
-        temp_playlist: normalized_input.temp_playlist,
-        success_destination,
+                .into_response();
+        }
     };
+
+    let mut req = req.clone();
+    req.file = resolved_job_file;
+
+    let job = Job { id, req };
 
     let queue_position = {
         let mut guard = state.queue_state.lock().await;
@@ -288,29 +209,13 @@ async fn prepare_job(
 
     info!(
         job_id = %id,
-        original_path = %job.original_path.display(),
-        cli_path = %job.req.file.display(),
-        temp_playlist = ?job.temp_playlist,
-        success_destination = ?job.success_destination,
+        path = %job.req.file.display(),
         queue_position,
         has_custom_config = job.req.config.is_some(),
         extra_args = job.req.extra_args.as_ref().map(|a| a.len()).unwrap_or(0),
         "job accepted"
     );
 
-    Ok((job, queue_position))
-}
-
-async fn enqueue_job(
-    State(state): State<AppState>,
-    Json(req): Json<JobRequest>,
-) -> impl IntoResponse {
-    let (job, queue_position) = match prepare_job(&state, req).await {
-        Ok(prepared) => prepared,
-        Err((status, body)) => return (status, Json(body)).into_response(),
-    };
-
-    let id = job.id;
     if let Err(e) = state.tx.send(job).await {
         let mut guard = state.queue_state.lock().await;
         guard.queued.retain(|x| *x != id);
@@ -324,7 +229,7 @@ async fn enqueue_job(
 
     (
         StatusCode::ACCEPTED,
-        Json(serde_json::json!(JobAccepted { id, queue_position })),
+        Json(JobAccepted { id, queue_position }),
     )
         .into_response()
 }
@@ -351,18 +256,10 @@ async fn worker_loop(mut rx: mpsc::Receiver<Job>, queue_state: Arc<Mutex<QueueSt
             info!(job_id = %job.id, remaining_queue = s.queued.len(), "job started");
         }
 
-        let started_at = SystemTime::now();
-        let job_result = run_job(&cli, &job).await;
-
-        match &job_result {
-            Ok(()) => {
-                info!(job_id = %job.id, "onetagger-cli completed successfully");
-                inspect_final_single_file_location(&job, started_at).await;
-            }
-            Err(e) => error!(job_id = %job.id, error = %e, "onetagger-cli failed"),
+        match run_job(&cli, &job).await {
+            Ok(()) => info!(job_id = %job.id, "job completed"),
+            Err(e) => error!(job_id = %job.id, error = %e, "job failed"),
         }
-
-        cleanup_temp_playlist(&job).await;
 
         let mut s = queue_state.lock().await;
         s.running = None;
@@ -390,16 +287,12 @@ async fn run_job(cli: &Cli, job: &Job) -> Result<()> {
         cmd.args(extra_args);
     }
 
-    let command_preview = build_command_preview(cli, job, &config_path);
     info!(
         job_id = %job.id,
         cli = %cli.cli_bin,
-        original_path = %job.original_path.display(),
-        cli_path = %job.req.file.display(),
-        temp_playlist = ?job.temp_playlist,
+        path = %job.req.file.display(),
         config = %config_path.display(),
         extra_args = ?job.req.extra_args,
-        command = ?command_preview,
         "executing onetagger-cli job"
     );
 
@@ -474,12 +367,9 @@ async fn normalize_cli_input_path(
     config_dir: &Path,
     job_id: Uuid,
     requested: &Path,
-) -> Result<NormalizedInput> {
+) -> Result<PathBuf> {
     if requested.is_dir() {
-        return Ok(NormalizedInput {
-            cli_path: requested.to_path_buf(),
-            temp_playlist: None,
-        });
+        return Ok(requested.to_path_buf());
     }
 
     if !requested.is_file() {
@@ -492,10 +382,7 @@ async fn normalize_cli_input_path(
         .unwrap_or_default();
 
     if PLAYLIST_EXTENSIONS.iter().any(|e| *e == ext) {
-        return Ok(NormalizedInput {
-            cli_path: requested.to_path_buf(),
-            temp_playlist: None,
-        });
+        return Ok(requested.to_path_buf());
     }
 
     let queue_dir = config_dir.join("queue");
@@ -516,275 +403,7 @@ async fn normalize_cli_input_path(
         "wrapped single file request into temporary playlist for cli compatibility"
     );
 
-    Ok(NormalizedInput {
-        cli_path: playlist_path.clone(),
-        temp_playlist: Some(playlist_path),
-    })
-}
-
-async fn load_move_config(config_path: &Path) -> Result<AutotaggerMoveConfig> {
-    let bytes = fs::read(config_path)
-        .await
-        .with_context(|| format!("failed reading config {}", config_path.display()))?;
-    let json: serde_json::Value = serde_json::from_slice(&bytes)
-        .with_context(|| format!("failed parsing config {}", config_path.display()))?;
-
-    let move_success = json
-        .get("moveSuccess")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    let move_success_path = json
-        .get("moveSuccessPath")
-        .and_then(|v| v.as_str())
-        .filter(|p| !p.trim().is_empty())
-        .map(PathBuf::from);
-
-    if move_success {
-        match &move_success_path {
-            Some(path) if path.exists() => {
-                info!(destination = %path.display(), "autotagger success destination configured and mounted");
-            }
-            Some(path) => {
-                warn!(
-                    destination = %path.display(),
-                    "autotagger success destination is configured but does not exist in the container; verify the host path is mounted or files may appear missing"
-                );
-            }
-            None => {
-                warn!("autotagger moveSuccess is enabled but moveSuccessPath is empty; tagged files may remain in the input folder");
-            }
-        }
-    } else {
-        warn!("autotagger moveSuccess is disabled; tagged files are expected to remain at the original input path");
-    }
-
-    Ok(AutotaggerMoveConfig {
-        move_success,
-        move_success_path,
-    })
-}
-
-fn build_command_preview(cli: &Cli, job: &Job, config_path: &Path) -> Vec<String> {
-    let mut command = vec![
-        cli.cli_bin.clone(),
-        "autotagger".to_string(),
-        "--path".to_string(),
-        job.req.file.display().to_string(),
-        "--config".to_string(),
-        config_path.display().to_string(),
-    ];
-    if let Some(extra_args) = &job.req.extra_args {
-        command.extend(extra_args.clone());
-    }
-    command
-}
-
-async fn inspect_final_single_file_location(job: &Job, started_at: SystemTime) {
-    if job.temp_playlist.is_none() {
-        debug!(job_id = %job.id, "final file inspection skipped for directory/playlist request");
-        return;
-    }
-
-    let original = &job.original_path;
-    let expected = job
-        .success_destination
-        .as_ref()
-        .and_then(|dir| original.file_name().map(|name| dir.join(name)));
-
-    if let Some(expected) = &expected {
-        if expected.exists() {
-            info!(
-                job_id = %job.id,
-                original_path = %original.display(),
-                final_path = %expected.display(),
-                "tagged file found at configured success destination"
-            );
-            return;
-        }
-        warn!(
-            job_id = %job.id,
-            expected_path = %expected.display(),
-            "tagged file not found at configured success destination"
-        );
-    } else {
-        warn!(
-            job_id = %job.id,
-            "no configured success destination found in autotagger config; tagged file may remain in place or be written to an internal container path"
-        );
-    }
-
-    if original.exists() {
-        info!(
-            job_id = %job.id,
-            final_path = %original.display(),
-            "original file still exists after successful tagging"
-        );
-        return;
-    }
-
-    if let Some(found) = locate_moved_file(job, started_at).await {
-        info!(
-            job_id = %job.id,
-            original_path = %original.display(),
-            final_path = %found.display(),
-            "located moved or renamed tagged file"
-        );
-    } else {
-        warn!(
-            job_id = %job.id,
-            original_path = %original.display(),
-            success_destination = ?job.success_destination,
-            "could not locate tagged file after successful CLI run; verify moveSuccessPath is mounted in the container"
-        );
-    }
-}
-
-async fn locate_moved_file(job: &Job, started_at: SystemTime) -> Option<PathBuf> {
-    let mut candidates = Vec::new();
-
-    if let Some(destination) = &job.success_destination {
-        candidates.push(destination.clone());
-    }
-    if let Some(parent) = job.original_path.parent() {
-        candidates.push(parent.to_path_buf());
-    }
-
-    let original_ext = job.original_path.extension().and_then(OsStr::to_str);
-    let original_stem = job
-        .original_path
-        .file_stem()
-        .and_then(OsStr::to_str)
-        .map(|s| s.to_lowercase());
-
-    for dir in candidates {
-        if !dir.is_dir() {
-            continue;
-        }
-
-        let mut entries = match fs::read_dir(&dir).await {
-            Ok(entries) => entries,
-            Err(e) => {
-                warn!(directory = %dir.display(), error = %e, "failed reading directory while locating tagged file");
-                continue;
-            }
-        };
-
-        while let Ok(Some(entry)) = entries.next_entry().await {
-            let path = entry.path();
-            if !path.is_file() {
-                continue;
-            }
-            if original_ext.is_some() && path.extension().and_then(OsStr::to_str) != original_ext {
-                continue;
-            }
-
-            let stem_matches = original_stem.as_ref().is_some_and(|stem| {
-                path.file_stem()
-                    .and_then(OsStr::to_str)
-                    .map(|candidate| {
-                        let candidate = candidate.to_lowercase();
-                        candidate.contains(stem) || stem.contains(&candidate)
-                    })
-                    .unwrap_or(false)
-            });
-
-            let modified_after_start = entry
-                .metadata()
-                .await
-                .ok()
-                .and_then(|m| m.modified().ok())
-                .map(|modified| modified >= started_at)
-                .unwrap_or(false);
-
-            if stem_matches || modified_after_start {
-                return Some(path);
-            }
-        }
-    }
-
-    None
-}
-
-async fn cleanup_temp_playlist(job: &Job) {
-    let Some(path) = &job.temp_playlist else {
-        return;
-    };
-
-    match fs::remove_file(path).await {
-        Ok(()) => {
-            info!(job_id = %job.id, temp_playlist = %path.display(), "temporary playlist cleaned up")
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            warn!(job_id = %job.id, temp_playlist = %path.display(), "temporary playlist was already removed")
-        }
-        Err(e) => {
-            warn!(job_id = %job.id, temp_playlist = %path.display(), error = %e, "failed cleaning up temporary playlist")
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    fn unique_test_path(filename: &str) -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system time before unix epoch")
-            .as_nanos();
-        std::env::temp_dir().join(format!("onetagger-worker-test-{nanos}-{filename}"))
-    }
-
-    #[tokio::test]
-    async fn load_move_config_reads_success_destination() {
-        let config_path = unique_test_path("config.json");
-        fs::write(
-            &config_path,
-            r#"{"moveSuccess":true,"moveSuccessPath":"/tubetube/Tagged"}"#,
-        )
-        .await
-        .expect("write config");
-
-        let config = load_move_config(&config_path).await.expect("load config");
-
-        assert!(config.move_success);
-        assert_eq!(
-            config.move_success_path,
-            Some(PathBuf::from("/tubetube/Tagged"))
-        );
-
-        let _ = fs::remove_file(config_path).await;
-    }
-
-    #[tokio::test]
-    async fn normalize_single_file_creates_temp_playlist() {
-        let config_dir = unique_test_path("config-dir");
-        let input_file = unique_test_path("track.mp3");
-        fs::create_dir_all(&config_dir)
-            .await
-            .expect("create config dir");
-        fs::write(&input_file, b"fake mp3")
-            .await
-            .expect("write input");
-
-        let normalized = normalize_cli_input_path(&config_dir, Uuid::new_v4(), &input_file)
-            .await
-            .expect("normalize input");
-
-        assert!(normalized.cli_path.exists());
-        assert_eq!(normalized.temp_playlist, Some(normalized.cli_path.clone()));
-
-        let playlist = fs::read_to_string(&normalized.cli_path)
-            .await
-            .expect("read playlist");
-        assert!(playlist.contains("#EXTM3U"));
-        assert!(playlist.contains(&input_file.display().to_string()));
-
-        let _ = fs::remove_file(&normalized.cli_path).await;
-        let _ = fs::remove_file(input_file).await;
-        let _ = fs::remove_dir_all(config_dir).await;
-    }
+    Ok(playlist_path)
 }
 
 async fn shutdown_signal() {

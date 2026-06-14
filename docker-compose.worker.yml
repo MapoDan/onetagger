@@ -11,6 +11,3 @@ services:
     environment:
       ONETAGGER_WORKER_BIND: 0.0.0.0:8080
       ONETAGGER_CONFIG_DIR: /config
-      RUST_LOG: info
-      # Optional: uncomment to enqueue a folder once at container startup.
-      # ONETAGGER_STARTUP_PATH: /music/clean

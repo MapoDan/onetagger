@@ -149,7 +149,7 @@ Enqueue a new autotagger job.
 
 **Fields**
 - `file` (required): input path passed to `onetagger-cli autotagger --path`.
-  - If you send a single audio file path, worker auto-wraps it into a temporary `.m3u8` playlist for CLI compatibility, keeps the original path in job metadata, inspects the final tagged location after success, and deletes the temporary playlist at job end.
+  - If you send a single audio file path, worker auto-wraps it into a temporary `.m3u8` playlist for CLI compatibility.
 - `config` (optional): config path passed to `--config`.
   - Default: `/config/autotagger.json`.
 - `extra_args` (optional): additional CLI flags appended as-is.
@@ -186,31 +186,8 @@ docker build -f Dockerfile.worker -t onetagger-worker:local .
 ### Run with Docker
 
 ```bash
-docker run -d --name onetagger-worker \
-  -p 8080:8080 \
-  -v $(pwd)/config:/config \
-  -v /path/to/your/music:/music \
-  -e RUST_LOG=info \
-  ghcr.io/<owner>/onetagger-worker:latest
+docker run -d --name onetagger-worker   -p 8080:8080   -v $(pwd)/config:/config   -v /path/to/your/music:/music   -e RUST_LOG=info   ghcr.io/<owner>/onetagger-worker:latest
 ```
-
-
-### Optional startup processing
-
-By default, the worker is intentionally idle after startup and waits for API calls (`POST /jobs`).
-If you want the container to process a folder automatically when it starts, set `ONETAGGER_STARTUP_PATH`:
-
-```bash
-docker run -d --name onetagger-worker \
-  -p 8080:8080 \
-  -v $(pwd)/config:/config \
-  -v /path/to/your/music:/music \
-  -e ONETAGGER_STARTUP_PATH=/music/clean \
-  -e RUST_LOG=info \
-  ghcr.io/<owner>/onetagger-worker:latest
-```
-
-This enqueues the configured path once at boot. The API remains available for additional queued jobs.
 
 ### Run with Docker Compose / Portainer
 
@@ -226,8 +203,7 @@ This enables Portainer to auto-pull image updates without local builds.
 - `ONETAGGER_WORKER_BIND` (default: `0.0.0.0:8080`)
 - `ONETAGGER_CLI_BIN` (default: `/usr/local/bin/onetagger-cli` inside image)
 - `ONETAGGER_CONFIG_DIR` (default: `/config`)
-- `RUST_LOG` (default in container: `info`; use `debug` for detailed troubleshooting)
-- `ONETAGGER_STARTUP_PATH` (optional; when set, this path is queued once when the container starts)
+- `RUST_LOG` (recommended: `info` or `debug`)
 
 ### Troubleshooting and observability
 
@@ -236,9 +212,6 @@ This enables Portainer to auto-pull image updates without local builds.
 - Each API request logs the **full received payload** (`file`, `config`, `extra_args`) for troubleshooting.
 - Each request also logs job id, queue position, path and custom config usage.
 - Each execution logs: resolved config path, extra args and CLI invocation lifecycle.
-- Single-file jobs log the original input path, temporary playlist path, expected success destination from `moveSuccessPath`, and final located MP3 path after tagging.
-- Temporary worker playlists in `/config/queue` are removed after each single-file job, both on success and failure.
-- If `moveSuccess` / `moveSuccessPath` is disabled, empty, or points to a path that is not mounted in the container, the worker logs a clear warning because tagged files may remain in place or appear to disappear into a container-internal path.
 - Failures include CLI exit code plus stdout/stderr to speed up root-cause analysis.
 
 ### Automated GHCR publishing (GitHub CI/CD)
