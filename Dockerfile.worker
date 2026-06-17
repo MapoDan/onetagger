@@ -26,5 +26,6 @@ EXPOSE 8080
 ENV ONETAGGER_WORKER_BIND=0.0.0.0:8080 \
     ONETAGGER_CLI_BIN=/usr/local/bin/onetagger-cli \
     ONETAGGER_CONFIG_DIR=/config \
+    ONETAGGER_TAGGED_DIR=/tubetube/Tagged \
     RUST_LOG=info
 ENTRYPOINT ["/usr/local/bin/onetagger-worker"]

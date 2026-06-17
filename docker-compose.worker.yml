@@ -7,7 +7,11 @@ services:
       - "8080:8080"
     volumes:
       - ./config:/config
-      - /path/to/your/music:/music
+      - /path/to/your/tubetube:/tubetube
     environment:
       ONETAGGER_WORKER_BIND: 0.0.0.0:8080
       ONETAGGER_CONFIG_DIR: /config
+      ONETAGGER_TAGGED_DIR: /tubetube/Tagged
+      RUST_LOG: info
+      # Optional: uncomment to enqueue a folder once at container startup.
+      # ONETAGGER_STARTUP_PATH: /tubetube/Clean

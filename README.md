@@ -149,7 +149,7 @@ Enqueue a new autotagger job.
 
 **Fields**
 - `file` (required): input path passed to `onetagger-cli autotagger --path`.
-  - If you send a single audio file path, worker auto-wraps it into a temporary `.m3u8` playlist for CLI compatibility.
+  - If you send a single audio file path, worker auto-wraps it into a temporary `.m3u8` playlist for CLI compatibility, keeps the original path in job metadata, inspects the final tagged location after success, and deletes the temporary playlist at job end.
 - `config` (optional): config path passed to `--config`.
   - Default: `/config/autotagger.json`.
 - `extra_args` (optional): additional CLI flags appended as-is.
@@ -178,7 +178,7 @@ docker build -f Dockerfile.worker -t onetagger-worker:local .
 
 ### Runtime prerequisites
 
-- A mounted music library (example: `/music`).
+- A mounted music library (example: mount your host library root to `/tubetube`, with inputs under `/tubetube/Clean` and tagged outputs under `/tubetube/Tagged`).
 - A mounted configuration directory (example: `/config`).
 - Worker auto-generates `/config/autotagger.json` at startup when missing (using `onetagger-cli --autotagger-config`).
 - You can still pass an explicit `config` path per job.
@@ -186,14 +186,38 @@ docker build -f Dockerfile.worker -t onetagger-worker:local .
 ### Run with Docker
 
 ```bash
-docker run -d --name onetagger-worker   -p 8080:8080   -v $(pwd)/config:/config   -v /path/to/your/music:/music   -e RUST_LOG=info   ghcr.io/<owner>/onetagger-worker:latest
+docker run -d --name onetagger-worker \
+  -p 8080:8080 \
+  -v $(pwd)/config:/config \
+  -v /path/to/your/tubetube:/tubetube \
+  -e ONETAGGER_TAGGED_DIR=/tubetube/Tagged \
+  -e RUST_LOG=info \
+  ghcr.io/<owner>/onetagger-worker:latest
 ```
+
+
+### Optional startup processing
+
+By default, the worker is intentionally idle after startup and waits for API calls (`POST /jobs`).
+If you want the container to process a folder automatically when it starts, set `ONETAGGER_STARTUP_PATH`:
+
+```bash
+docker run -d --name onetagger-worker \
+  -p 8080:8080 \
+  -v $(pwd)/config:/config \
+  -v /path/to/your/tubetube:/tubetube \
+  -e ONETAGGER_STARTUP_PATH=/tubetube/Clean \
+  -e RUST_LOG=info \
+  ghcr.io/<owner>/onetagger-worker:latest
+```
+
+This enqueues the configured path once at boot. The API remains available for additional queued jobs.
 
 ### Run with Docker Compose / Portainer
 
 Use `docker-compose.worker.yml` as stack template:
 - set your published image tag,
-- map `/music` to your host music folder,
+- map `/tubetube` to your host library folder (so `/tubetube/Clean` and `/tubetube/Tagged` are visible inside the container),
 - map `/config` to persistent host storage.
 
 This enables Portainer to auto-pull image updates without local builds.
@@ -203,7 +227,9 @@ This enables Portainer to auto-pull image updates without local builds.
 - `ONETAGGER_WORKER_BIND` (default: `0.0.0.0:8080`)
 - `ONETAGGER_CLI_BIN` (default: `/usr/local/bin/onetagger-cli` inside image)
 - `ONETAGGER_CONFIG_DIR` (default: `/config`)
-- `RUST_LOG` (recommended: `info` or `debug`)
+- `ONETAGGER_TAGGED_DIR` (default: `/tubetube/Tagged`; single-file jobs are moved here after successful tagging)
+- `RUST_LOG` (default in container: `info`; use `debug` for detailed troubleshooting)
+- `ONETAGGER_STARTUP_PATH` (optional; when set, this path is queued once when the container starts)
 
 ### Troubleshooting and observability
 
@@ -212,6 +238,10 @@ This enables Portainer to auto-pull image updates without local builds.
 - Each API request logs the **full received payload** (`file`, `config`, `extra_args`) for troubleshooting.
 - Each request also logs job id, queue position, path and custom config usage.
 - Each execution logs: resolved config path, extra args and CLI invocation lifecycle.
+- Single-file jobs log the original input path, temporary playlist path, wrapper destination from `ONETAGGER_TAGGED_DIR`, and final moved MP3 path after tagging.
+- After successful tagging, single-file jobs are moved by the worker to `ONETAGGER_TAGGED_DIR`; filename conflicts are resolved with suffixes such as ` (1)`, ` (2)`, etc.
+- Temporary worker playlists in `/config/queue` are removed after each single-file job, both on success and failure.
+- The worker still reads `moveSuccess` / `moveSuccessPath` from `autotagger.json` for diagnostics and logs a clear warning if the original OneTagger move destination is disabled, empty, or not mounted.
 - Failures include CLI exit code plus stdout/stderr to speed up root-cause analysis.
 
 ### Automated GHCR publishing (GitHub CI/CD)
